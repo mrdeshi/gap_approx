@@ -145,6 +145,43 @@ class Covering:
             return True, x_val
         return False, {}
     
+    def opt_IP(self, verbose=False):
+        model = Model('Restricted assignment with 2 processing times')
+        if not verbose:
+            model.hideOutput()
+
+        # Decision variables
+        x = {}
+        for i in range(self.n_machines):
+            for j in range(self.n_jobs):
+                x[i, j] = model.addVar(vtype="B", name=f"x({i},{j})", lb=0.0)
+
+        # Makespan
+        C_max = model.addVar(vtype="C", name="C_max", lb=0.0)
+
+        # Objective function
+        model.setObjective(C_max, "minimize")
+
+        # Constraint 1. You have to allocate each job
+        for j in range(self.n_jobs):
+            model.addCons(sum(x[i, j] for i in range(self.n_machines)) == 1)
+
+        # Constraint 2. The processing time on each machine must be at most C_max
+        for i in range(self.n_machines):
+            model.addCons(sum(x[i, j] * int(self.p_times[j]) for j in range(self.n_jobs)) <= C_max)
+
+        # Print the model
+        # model.writeProblem('model.lp')
+
+        # Optimize the model
+        model.optimize()
+        # model.freeTransform()
+
+        solution = list({j: i for j in range(self.n_jobs) for i in range(self.n_machines) if model.getVal(x[i, j]) > 0.5}.values())
+
+        return solution, model.getObjVal()
+
+    
     
     def solve(self, T, job_pair=[-1, -1]):
         print("to implement")
@@ -250,42 +287,7 @@ class Covering:
 
         
 
-    def opt_IP(self, verbose=False):
-        model = Model('Restricted assignment with 2 processing times')
-        if not verbose:
-            model.hideOutput()
-
-        # Decision variables
-        x = {}
-        for i in range(self.n_machines):
-            for j in range(self.n_jobs):
-                x[i, j] = model.addVar(vtype="B", name=f"x({i},{j})", lb=0.0)
-
-        # Makespan
-        C_max = model.addVar(vtype="C", name="C_max", lb=0.0)
-
-        # Objective function
-        model.setObjective(C_max, "minimize")
-
-        # Constraint 1. You have to allocate each job
-        for j in range(self.n_jobs):
-            model.addCons(sum(x[i, j] for i in range(self.n_machines)) == 1)
-
-        # Constraint 2. The processing time on each machine must be at most C_max
-        for i in range(self.n_machines):
-            model.addCons(sum(x[i, j] * int(self.p_times[j]) for j in range(self.n_jobs)) <= C_max)
-
-        # Print the model
-        # model.writeProblem('model.lp')
-
-        # Optimize the model
-        model.optimize()
-        # model.freeTransform()
-
-        solution = list({j: i for j in range(self.n_jobs) for i in range(self.n_machines) if model.getVal(x[i, j]) > 0.5}.values())
-
-        return solution, model.getObjVal()
-
+    
     def gap(self):
         return self.opt_IP()[1] / self.opt_LP()
 
