@@ -1,7 +1,11 @@
+import random
 from pyscipopt import Model
 from itertools import combinations
 from itertools import product
+from pyscipopt import quicksum
 import numpy as np
+import time
+from tqdm import tqdm 
 """
 We consider the case separately when there are just 2 machines. In that case, the problem is equivalent
 with the covering polyhedra with an easier formulation. We can further assume that no machine-exclusive job exists.
@@ -71,38 +75,140 @@ class Covering:
 
         return right, x_keep
 
-    def is_feasible(self, T, job_pair = [-1, -1]):
+    def is_feasible(self, T, job_pair = [-1, -1], columnGeneration=False):
+        
         """
         :param T: integer
         :return: True if LP(T) is feasible, otherwise False
         """
-        model = Model('Restricted assignment with 2 processing times')
+        model = Model('CONFIGURATION LP')
         model.hideOutput()
-
         # Determining valid configurations (with makespan at most T) for each machine in the form of a dict
         # Values are lists of tuples, one tuple for each valid configuration
         # When a job pair is specified, we leave out all configs containing both jobs.
         configs = [c for length in range(1, self.n_jobs + 1) for c in combinations(range(self.n_jobs), length) if
-                   sum(int(self.p_times[j]) for j in c) <= T and not (job_pair[0] in c and job_pair[1] in c)]
+                sum(int(self.p_times[j]) for j in c) <= T and not (job_pair[0] in c and job_pair[1] in c)]
+
+        
+
+        if (not columnGeneration):
+           
+            
+            # Decision variables
+            x = {}
+            for c in configs:
+                x[c] = model.addVar(vtype="C", name=f"x({c})", lb=0.0)
+            # The sum of the variables is at most 2.
+            model.addCons(quicksum(x[c] for c in configs) <= self.n_machines)
+
+            # Each job gets allocated at least once
+            for j in range(self.n_jobs):
+                model.addCons(quicksum(x[c] for c in configs if j in c) >= 1)
+
+            model.optimize()
+
+            if model.getStatus() == 'optimal':
+                x_val = dict(zip(x.keys(), [model.getVal(x[e]) for e in x.keys()]))
+                return True, x_val
+            return False, {}
+
 
         # Decision variables
         x = {}
-        for c in configs:
+        #constraint
+        s = []
+
+        group = []
+        for j in range(self.n_jobs):
+            s.append(0)
+            group.append(j)
+
+        #return self.columnGen(x,s,model,T,group)
+
+        total_machines = 0
+        random.shuffle(configs)
+        #configs.reverse()
+        for c in tqdm(configs):
+            
+            model.freeTransform()
             x[c] = model.addVar(vtype="C", name=f"x({c})", lb=0.0)
 
-        # The sum of the variables is at most 2.
-        model.addCons(sum(x[c] for c in configs) <= self.n_machines)
 
-        # Each job gets allocated at least once
-        for j in range(self.n_jobs):
-            model.addCons(sum(x[c] for c in configs if j in c) >= 1)
+            # The sum of the variables is at most 2.
+            if not total_machines:
+                total_machines = model.addCons((x[c]) <= self.n_machines)
+            else:
+                model.addConsCoeff(total_machines,x[c],1)
 
-        model.optimize()
 
-        if model.getStatus() == 'optimal':
-            x_val = dict(zip(x.keys(), [model.getVal(x[e]) for e in x.keys()]))
-            return True, x_val
+            # Each job gets allocated at least once
+            check = False
+            for j in range(self.n_jobs):
+                if j in c:
+                    if s[j] == 0:
+                        s[j] = model.addCons(x[c]>=1)
+                        check = True
+                    else: 
+                        model.addConsCoeff(s[j], x[c],1)
+            for j in range(self.n_jobs):
+                if s[j] == 0:
+                    check = True
+
+            if check: continue
+
+            model.optimize()
+
+            if model.getStatus() == 'optimal':
+                x_val = dict(zip(x.keys(), [model.getVal(x[e]) for e in x.keys()]))
+                return True, x_val
         return False, {}
+    
+
+    #deprecated, nt
+    def columnGen(self,x,s, model,T,total_machines, group = []):
+
+        if group:
+            result = self.columnGen(x,s,model,T,group[:-1])
+            if result and len(result)>0:
+                for partial in result:
+                    if len(partial)==0: continue
+                    print("AAAAAAAAAA",partial)
+                    model.freeTransform()
+                    x[partial] = model.addVar(vtype="C", name=f"x({partial})", lb=0.0)
+
+
+                    # The sum of the variables is at most 2.
+                    if not total_machines:
+                        total_machines = model.addCons((x[partial]) <= self.n_machines)
+                    else:
+                        model.addConsCoeff(total_machines,x[group],1)
+
+
+                    # Each job gets allocated at least once
+                    check = False
+                    for j in range(self.n_jobs):
+                        if j in partial:
+                            if s[j] == 0:
+                                s[j] = model.addCons(x[partial]>=1)
+                                check = True
+                            else: 
+                                model.addConsCoeff(s[j], x[partial],1)
+                    for j in range(self.n_jobs):
+                        if s[j] == 0:
+                            check = True
+
+                    if not check: return result
+                    model.optimize()
+
+                    if model.getStatus() == 'optimal':
+                        x_val = dict(zip(x.keys(), [model.getVal(x[e]) for e in x.keys()]))
+                        return True, x_val
+            return result + [c + [group[-1]] for c in result]
+            
+            
+        else:
+            return [[]]
+
     
     def is_half_integral_feasible(self, T, job_pair = [-1, -1]):
         """
@@ -127,7 +233,7 @@ class Covering:
         
 
         # The sum of the variables is at most 2.
-        model.addCons(sum(x[c]/2 for c in configs) <= self.n_machines)
+        model.addCons(quicksum(x[c]/2 for c in configs) <= self.n_machines)
     
         # half integrality
         for c in configs:
@@ -136,7 +242,7 @@ class Covering:
 
         # Each job gets allocated at least once
         for j in range(self.n_jobs):
-            model.addCons(sum(x[c]/2 for c in configs if j in c) >= 1)
+            model.addCons(quicksum(x[c]/2 for c in configs if j in c) == 1)
 
         model.optimize()
 
@@ -164,11 +270,11 @@ class Covering:
 
         # Constraint 1. You have to allocate each job
         for j in range(self.n_jobs):
-            model.addCons(sum(x[i, j] for i in range(self.n_machines)) == 1)
+            model.addCons(quicksum(x[i, j] for i in range(self.n_machines)) == 1)
 
         # Constraint 2. The processing time on each machine must be at most C_max
         for i in range(self.n_machines):
-            model.addCons(sum(x[i, j] * int(self.p_times[j]) for j in range(self.n_jobs)) <= C_max)
+            model.addCons(quicksum(x[i, j] * int(self.p_times[j]) for j in range(self.n_jobs)) <= C_max)
 
         # Print the model
         # model.writeProblem('model.lp')
@@ -186,7 +292,7 @@ class Covering:
     def solve(self, T, job_pair=[-1, -1]):
         print("to implement")
 
-    def find_half_integral_persistence(self,dictionary, column_generation=True):
+    def find_half_integral_persistence(self,dictionary, column_generation=True, verbose=False):
         """
         :param dictionary: the feasible solution
         :return: True if there is any arbitrary reformulation of y that is half-integral given a persistent, feasble configuration, otherwise False
@@ -194,12 +300,12 @@ class Covering:
         clean = {} #dictionary with only configurations that has positive non-zero value 
         if(not dictionary):
             print("not feasible")
-            return
-        print("start with \n")
+            return False
+        if verbose :print("original y= \n")
         for k in dictionary.keys():
             if (dictionary.get(k)>0.0000000000000001):
                 clean[k] = dictionary.get(k)
-                print("subset=",k,"ibrid machine=",dictionary.get(k))
+                if verbose:print("subset=",k,"ibrid machine=",dictionary.get(k))
 
         complete = {} #dictionary for each job the % of completeness in {0,0.5,1}
     
@@ -285,7 +391,6 @@ class Covering:
 
         return self.config_find(v+0.5,clean,complete,power, step) or self.config_find(0,clean_cop,complete_cop,p, step+1)
 
-        
 
     
     def gap(self):
