@@ -5,6 +5,7 @@ from itertools import product
 from pyscipopt import quicksum
 import numpy as np
 import time
+import pyscipopt
 from tqdm import tqdm 
 """
 We consider the case separately when there are just 2 machines. In that case, the problem is equivalent
@@ -74,6 +75,45 @@ class Covering:
                 left = m
 
         return right, x_keep
+    
+    def solve_knapsack(self, values, T):
+        """0-1 knapsack pricing subproblem for the CG branch of is_feasible.
+
+        Maximize sum_{j in C} values[j] s.t. sum_{j in C} p_j <= T,
+        where values is the vector of dual prices pi_j of the covering
+        constraints in the current restricted master problem.
+
+        Returns (max_value, selected_indices).  Uses a ``taken`` back-
+        pointer table during the forward DP pass, so the reconstruction
+        phase does not rely on float equality comparisons.
+        """
+        capacity = max(0, int(T))
+        weights = [int(p) for p in self.p_times]
+        n = len(values)
+        dp = [0.0] * (capacity + 1)
+        taken = [[False] * (capacity + 1) for _ in range(n)]
+
+        for j in range(n):
+            w_j = weights[j]
+            v_j = values[j]
+            if w_j > capacity:
+                continue
+            for w in range(capacity, w_j - 1, -1):
+                cand = dp[w - w_j] + v_j
+                if cand > dp[w] + 1e-12:
+                    dp[w] = cand
+                    taken[j][w] = True
+
+        # Reconstruct via the back-pointer table to avoid float-equality
+        # bugs that would otherwise bite with floating dual prices.
+        w = capacity
+        C_star = []
+        for j in range(n - 1, -1, -1):
+            if taken[j][w]:
+                C_star.append(j)
+                w -= weights[j]
+
+        return dp[capacity], C_star
 
     def is_feasible(self, T, job_pair = [-1, -1], columnGeneration=False):
         
@@ -86,14 +126,14 @@ class Covering:
         # Determining valid configurations (with makespan at most T) for each machine in the form of a dict
         # Values are lists of tuples, one tuple for each valid configuration
         # When a job pair is specified, we leave out all configs containing both jobs.
-        configs = [c for length in range(1, self.n_jobs + 1) for c in combinations(range(self.n_jobs), length) if
-                sum(int(self.p_times[j]) for j in c) <= T and not (job_pair[0] in c and job_pair[1] in c)]
+        
 
         
 
         if (not columnGeneration):
            
-            
+            configs = [c for length in range(1, self.n_jobs + 1) for c in combinations(range(self.n_jobs), length) if
+                sum(int(self.p_times[j]) for j in c) <= T and not (job_pair[0] in c and job_pair[1] in c)]
             # Decision variables
             x = {}
             for c in configs:
@@ -113,55 +153,91 @@ class Covering:
             return False, {}
 
 
-        # Decision variables
+        # -- Column generation branch ----------------------------------
+        # Phase-1 slack minimization: introduce a slack variable s_j >= 0
+        # per covering constraint with objective coefficient 1. The
+        # original Configuration LP is feasible iff the Phase-1 optimum
+        # is 0.
+        #
+        # Each iteration:
+        #   1. Solve the current restricted master problem (RMP).
+        #   2. Read dual prices pi_j of the covering constraints and mu
+        #      of the machine-budget constraint.
+        #   3. Solve a 0-1 knapsack pricing subproblem
+        #         max sum_{j in C} pi_j  s.t.  sum_{j in C} p_j <= T
+        #      to find the column with the smallest reduced cost.
+        #   4. If V* > |mu| + eps, the corresponding column is improving;
+        #      add it to the RMP and iterate.  Otherwise the RMP is
+        #      optimal over the full column set C(T):
+        #        - Phase-1 obj 0  -> original LP feasible   -> (True, x)
+        #        - Phase-1 obj >0 -> original LP infeasible -> (False, {})
+        #
+        # We use |mu| (abs) in the improving test to be robust to
+        # pyscipopt's sign convention for the dual of a <= constraint in
+        # a min problem (some builds flip the sign).
+        model.setPresolve(pyscipopt.SCIP_PARAMSETTING.OFF)
+
+        # Phase-1 slack variables with objective coefficient 1
+        s = [
+            model.addVar(vtype="C", name=f"s({j})", lb=0.0, obj=1.0)
+            for j in range(self.n_jobs)
+        ]
+
+        # Covering constraints: sum_{C ni j} x_C + s_j >= 1 for each job
+        cover = {
+            j: model.addCons(s[j] >= 1, name=f"cover_{j}")
+            for j in range(self.n_jobs)
+        }
+
+        # Machine-budget constraint created lazily on the first x column
+        budget = None
+
+        # Active x columns: config tuple -> SCIP variable
         x = {}
-        #constraint
-        s = []
 
-        group = []
-        for j in range(self.n_jobs):
-            s.append(0)
-            group.append(j)
-
-        #return self.columnGen(x,s,model,T,group)
-
-        total_machines = 0
-        random.shuffle(configs)
-        #configs.reverse()
-        for c in tqdm(configs):
-            
-            model.freeTransform()
-            x[c] = model.addVar(vtype="C", name=f"x({c})", lb=0.0)
-
-
-            # The sum of the variables is at most 2.
-            if not total_machines:
-                total_machines = model.addCons((x[c]) <= self.n_machines)
-            else:
-                model.addConsCoeff(total_machines,x[c],1)
-
-
-            # Each job gets allocated at least once
-            check = False
-            for j in range(self.n_jobs):
-                if j in c:
-                    if s[j] == 0:
-                        s[j] = model.addCons(x[c]>=1)
-                        check = True
-                    else: 
-                        model.addConsCoeff(s[j], x[c],1)
-            for j in range(self.n_jobs):
-                if s[j] == 0:
-                    check = True
-
-            if check: continue
-
+        while True:
             model.optimize()
+            obj_value = model.getObjVal()
 
-            if model.getStatus() == 'optimal':
-                x_val = dict(zip(x.keys(), [model.getVal(x[e]) for e in x.keys()]))
-                return True, x_val
-        return False, {}
+            pi = [
+                model.getDualsolLinear(cover[j]) for j in range(self.n_jobs)
+            ]
+            mu = (
+                model.getDualsolLinear(budget)
+                if budget is not None else 0.0
+            )
+
+            V_star, C_star = self.solve_knapsack(values=pi, T=T)
+
+            if V_star > abs(mu) + 1e-8:
+                # Improving column: add it to the RMP
+                c = tuple(sorted(C_star))
+                if c in x or len(c) == 0:
+                    # Degeneracy / no progress: terminate based on current
+                    # Phase-1 objective.
+                    if obj_value < 1e-8:
+                        x_val = {k: model.getVal(x[k]) for k in x}
+                        return True, x_val
+                    return False, {}
+
+                model.freeTransform()
+                x[c] = model.addVar(
+                    vtype="C", name=f"x({c})", lb=0.0
+                )
+                for j in c:
+                    model.addConsCoeff(cover[j], x[c], 1.0)
+                if budget is None:
+                    budget = model.addCons(
+                        x[c] <= self.n_machines, name="budget"
+                    )
+                else:
+                    model.addConsCoeff(budget, x[c], 1.0)
+            else:
+                # No improving column: RMP is optimal over the full C(T)
+                if obj_value < 1e-8:
+                    x_val = {k: model.getVal(x[k]) for k in x}
+                    return True, x_val
+                return False, {}
     
 
     #deprecated, nt
