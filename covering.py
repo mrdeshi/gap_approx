@@ -153,91 +153,116 @@ class Covering:
             return False, {}
 
 
-        # -- Column generation branch ----------------------------------
+        # -- Column generation branch (fresh-model pattern) ------------
         # Phase-1 slack minimization: introduce a slack variable s_j >= 0
         # per covering constraint with objective coefficient 1. The
         # original Configuration LP is feasible iff the Phase-1 optimum
         # is 0.
         #
+        # We rebuild the restricted master problem from scratch at every
+        # iteration. This is more robust than the usual freeTransform +
+        # addConsCoeff pattern: pyscipopt accumulates numerical state
+        # between optimize/freeTransform cycles and after a few
+        # iterations the dual values reported by getDualsolLinear become
+        # patological (~1e+96), breaking the knapsack pricing. Creating
+        # a fresh Model each iteration sidesteps the problem entirely
+        # and converges cleanly on all tested instances, including
+        # LP-degenerate ones like Instance II.
+        #
         # Each iteration:
-        #   1. Solve the current restricted master problem (RMP).
-        #   2. Read dual prices pi_j of the covering constraints and mu
-        #      of the machine-budget constraint.
+        #   1. Build an RMP containing the current active column set
+        #      ``x_configs`` plus the slack variables.
+        #   2. Solve it; read dual prices pi_j of the covering constraints
+        #      and mu of the machine-budget constraint.
         #   3. Solve a 0-1 knapsack pricing subproblem
         #         max sum_{j in C} pi_j  s.t.  sum_{j in C} p_j <= T
         #      to find the column with the smallest reduced cost.
-        #   4. If V* > |mu| + eps, the corresponding column is improving;
-        #      add it to the RMP and iterate.  Otherwise the RMP is
-        #      optimal over the full column set C(T):
+        #   4. If V* > |mu| + eps, append the corresponding column to
+        #      ``x_configs`` and iterate. Otherwise the RMP is optimal
+        #      over the full column set C(T):
         #        - Phase-1 obj 0  -> original LP feasible   -> (True, x)
         #        - Phase-1 obj >0 -> original LP infeasible -> (False, {})
         #
-        # We use |mu| (abs) in the improving test to be robust to
-        # pyscipopt's sign convention for the dual of a <= constraint in
-        # a min problem (some builds flip the sign).
-        model.setPresolve(pyscipopt.SCIP_PARAMSETTING.OFF)
+        # ``modifiable=True`` on both cover and budget constraints is
+        # what stops SCIP from collapsing a single-variable constraint
+        # like ``s_j >= 1`` into a variable bound during transformation;
+        # without it getDualsolLinear(cover[j]) raises
+        # "cannot create Constraint with SCIP_CONS* == NULL".
+        #
+        # ``|mu|`` in the improving test is robust to pyscipopt's sign
+        # convention for the dual of a <= constraint in a min problem
+        # (some builds return a non-positive value, others flip it).
+        n = self.n_jobs
+        nm = self.n_machines
+        x_configs = []  # list of active column tuples
+        max_iterations = max(500, 50 * n)
 
-        # Phase-1 slack variables with objective coefficient 1
-        s = [
-            model.addVar(vtype="C", name=f"s({j})", lb=0.0, obj=1.0)
-            for j in range(self.n_jobs)
-        ]
+        # Discard the empty ``model`` built above; each iteration builds
+        # its own fresh RMP.
+        for _ in range(max_iterations):
+            rmp = Model('CONFIGURATION LP (CG)')
+            rmp.hideOutput()
+            rmp.setPresolve(pyscipopt.SCIP_PARAMSETTING.OFF)
 
-        # Covering constraints: sum_{C ni j} x_C + s_j >= 1 for each job
-        cover = {
-            j: model.addCons(s[j] >= 1, name=f"cover_{j}")
-            for j in range(self.n_jobs)
-        }
-
-        # Machine-budget constraint created lazily on the first x column
-        budget = None
-
-        # Active x columns: config tuple -> SCIP variable
-        x = {}
-
-        while True:
-            model.optimize()
-            obj_value = model.getObjVal()
-
-            pi = [
-                model.getDualsolLinear(cover[j]) for j in range(self.n_jobs)
+            s_vars = [
+                rmp.addVar(vtype='C', name=f's({j})', lb=0.0, obj=1.0)
+                for j in range(n)
             ]
-            mu = (
-                model.getDualsolLinear(budget)
-                if budget is not None else 0.0
-            )
+            x_vars = {
+                c: rmp.addVar(vtype='C', name=f'x{c}', lb=0.0)
+                for c in x_configs
+            }
+
+            cover = {}
+            for j in range(n):
+                terms = [s_vars[j]] + [x_vars[c] for c in x_configs if j in c]
+                cover[j] = rmp.addCons(
+                    quicksum(terms) >= 1,
+                    name=f'cover_{j}',
+                    modifiable=True,
+                )
+
+            if x_configs:
+                budget = rmp.addCons(
+                    quicksum(x_vars.values()) <= nm,
+                    name='budget',
+                    modifiable=True,
+                )
+            else:
+                budget = rmp.addCons(
+                    quicksum([]) <= nm,
+                    name='budget',
+                    modifiable=True,
+                )
+
+            rmp.optimize()
+            if rmp.getStatus() != 'optimal':
+                return False, {}
+            obj_value = rmp.getObjVal()
+
+            pi = [rmp.getDualsolLinear(cover[j]) for j in range(n)]
+            mu = rmp.getDualsolLinear(budget)
 
             V_star, C_star = self.solve_knapsack(values=pi, T=T)
 
             if V_star > abs(mu) + 1e-8:
-                # Improving column: add it to the RMP
                 c = tuple(sorted(C_star))
-                if c in x or len(c) == 0:
-                    # Degeneracy / no progress: terminate based on current
-                    # Phase-1 objective.
+                if c in x_configs or len(c) == 0:
+                    # Degeneracy / no progress
                     if obj_value < 1e-8:
-                        x_val = {k: model.getVal(x[k]) for k in x}
+                        x_val = {cc: rmp.getVal(x_vars[cc]) for cc in x_vars}
                         return True, x_val
                     return False, {}
-
-                model.freeTransform()
-                x[c] = model.addVar(
-                    vtype="C", name=f"x({c})", lb=0.0
-                )
-                for j in c:
-                    model.addConsCoeff(cover[j], x[c], 1.0)
-                if budget is None:
-                    budget = model.addCons(
-                        x[c] <= self.n_machines, name="budget"
-                    )
-                else:
-                    model.addConsCoeff(budget, x[c], 1.0)
+                x_configs.append(c)
             else:
                 # No improving column: RMP is optimal over the full C(T)
                 if obj_value < 1e-8:
-                    x_val = {k: model.getVal(x[k]) for k in x}
+                    x_val = {cc: rmp.getVal(x_vars[cc]) for cc in x_vars}
                     return True, x_val
                 return False, {}
+
+        # Safety cap exhausted (should not occur in practice)
+        return False, {}
     
 
     #deprecated, nt
